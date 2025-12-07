@@ -1,76 +1,155 @@
-from flask import Flask, request, jsonify
+import os
+import uuid
+import time
+import requests
+from flask import Flask, request, jsonify, send_file, after_this_request
 from flask_cors import CORS
 import yt_dlp
+import static_ffmpeg
+
+# FFmpeg সেটআপ
+static_ffmpeg.add_paths()
 
 app = Flask(__name__)
 CORS(app)
 
-def get_download_info(url):
-    # আমরা এখানে কন্ডিশন দিচ্ছি: 
-    # ১. protocol^=http: লিংকটি অবশ্যই http/https হতে হবে (m3u8 না)
-    # ২. ext=mp4: ফরম্যাট অবশ্যই mp4 হতে হবে
-    # ৩. acodec!='none': অডিও থাকতে হবে
-    
-    ydl_opts = {
-        'format': 'best[protocol^=http][ext=mp4]/best[protocol^=http]',
-        'quiet': True,
-        'no_warnings': True,
-        'geo_bypass': True,
-        'noplaylist': True,
-        # কুকেজ সমস্যা এড়ানোর জন্য ইউজার এজেন্ট ব্যবহার করা
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+DOWNLOAD_DIR = "downloads"
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # ভিডিওর তথ্য বের করা
-            info = ydl.extract_info(url, download=False)
-            
-            # সেফটি চেক: যদি কোনো কারণে এরপরও m3u8 চলে আসে
-            download_url = info.get('url')
-            
-            if 'm3u8' in str(download_url):
-                # যদি মেইন লিংক m3u8 হয়, আমরা ফরম্যাট লিস্ট ঘেঁটে mp4 খুঁজব
-                formats = info.get('formats', [])
-                for f in reversed(formats): # উল্টো দিক থেকে লুপ চালাবো (ভালো কোয়ালিটি সাধারণত শেষে থাকে)
-                    f_url = f.get('url', '')
-                    f_ext = f.get('ext', '')
-                    f_proto = f.get('protocol', '')
-                    
-                    # শর্ত: mp4 হতে হবে এবং m3u8 হওয়া যাবে না
-                    if f_ext == 'mp4' and 'm3u8' not in f_url and 'http' in f_proto:
-                        download_url = f_url
-                        break
-            
-            return {
-                "status": "success",
-                "title": info.get('title', 'Video'),
-                "thumbnail": info.get('thumbnail', ''),
-                "download_url": download_url,
-                "ext": "mp4" # আমরা জোর করে mp4 বলছি কারণ আমরা ফিল্টার করেছি
-            }
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        return {
-            "status": "error", 
-            "message": "Direct MP4 link not found. Try a different video."
-        }
+def format_selector(ctx):
+    """এটি বেস্ট ভিডিও এবং অডিও ফরম্যাট সিলেক্ট করতে সাহায্য করে"""
+    return ctx.get('format_id')
 
 @app.route('/')
 def home():
-    return "Server is Running (Strict MP4 Mode) 🚀"
+    return "Ultra Downloader & Converter Running! 🚀"
 
 @app.route('/analyze', methods=['POST'])
-def analyze_link():
+def analyze():
     data = request.json
     url = data.get('url')
+    if not url: return jsonify({"status": "error", "message": "No URL"}), 400
 
-    if not url:
-        return jsonify({"status": "error", "message": "No URL provided"}), 400
+    # === ধাপ ১: চেক করি এটি সাধারণ ফাইল কিনা (Direct Link) ===
+    try:
+        head_check = requests.head(url, allow_redirects=True, timeout=3)
+        content_type = head_check.headers.get('Content-Type', '')
+        
+        # যদি এটি ভিডিও প্ল্যাটফর্ম না হয় এবং ডাইরেক্ট ফাইল হয়
+        if 'text/html' not in content_type and 'video' not in content_type:
+             return jsonify({
+                "status": "success",
+                "type": "direct_file",
+                "title": url.split('/')[-1] or "Unknown File",
+                "thumbnail": "https://cdn-icons-png.flaticon.com/512/2926/2926214.png",
+                "url": url
+            })
+    except:
+        pass # ফেইল করলে আমরা yt-dlp দিয়ে ট্রাই করব
 
-    result = get_download_info(url)
-    return jsonify(result)
+    # === ধাপ ২: ভিডিও প্ল্যাটফর্ম অ্যানালাইসিস ===
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            formats_list = []
+            seen_resolutions = set()
+
+            # ভিডিও ফরম্যাটগুলো খুঁজে বের করা
+            for f in info.get('formats', []):
+                # রেজোলিউশন আছে এবং ভিডিও কোডেক আছে
+                if f.get('height') and f.get('vcodec') != 'none':
+                    res = f"{f['height']}p"
+                    # ডুপ্লিকেট রিমুভ করা
+                    if res not in seen_resolutions:
+                        formats_list.append({
+                            'id': f['format_id'],
+                            'resolution': res,
+                            'ext': f['ext'],
+                            'note': f.get('format_note', '')
+                        })
+                        seen_resolutions.add(res)
+            
+            # ভালো দেখার জন্য রেজোলিউশন সর্ট করা (বড় থেকে ছোট)
+            formats_list.sort(key=lambda x: int(x['resolution'][:-1]), reverse=True)
+
+            return jsonify({
+                "status": "success",
+                "type": "video_platform",
+                "title": info.get('title', 'media'),
+                "thumbnail": info.get('thumbnail', ''),
+                "duration": info.get('duration_string', ''),
+                "formats": formats_list
+            })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Link not supported or Private."})
+
+
+@app.route('/process_download', methods=['GET'])
+def process_download():
+    url = request.args.get('url')
+    title = request.args.get('title', 'media')
+    mode = request.args.get('mode', 'video') # video / audio
+    quality = request.args.get('quality')    # resolution (1080p) or bitrate (192)
+
+    unique_id = uuid.uuid4()
+    filename = f"{unique_id}"
+    
+    ydl_opts = {
+        'outtmpl': os.path.join(DOWNLOAD_DIR, f"{filename}.%(ext)s"),
+        'quiet': True,
+        'noplaylist': True,
+    }
+
+    if mode == 'audio':
+        # অডিও কনভার্সন
+        ext = "mp3"
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': quality, # 128, 192, 320
+            }],
+        })
+    else:
+        # ভিডিও স্পেসিফিক কোয়ালিটি
+        ext = "mp4"
+        # ইউজার যে পিক্সেল সিলেক্ট করেছে (যেমন 1080), সেটার সমান বা নিচের সেরাটা নামাবে
+        target_height = quality.replace('p', '') 
+        
+        ydl_opts.update({
+            # লজিক: সিলেক্ট করা হাইট এর ভিডিও + বেস্ট অডিও -> মার্জ করে MP4
+            'format': f'bestvideo[height<={target_height}]+bestaudio/best[height<={target_height}]',
+            'merge_output_format': 'mp4',
+        })
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        final_path = os.path.join(DOWNLOAD_DIR, f"{filename}.{ext}")
+
+        @after_this_request
+        def remove_file(response):
+            try:
+                time.sleep(2)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+            except: pass
+            return response
+
+        return send_file(
+            final_path, 
+            as_attachment=True, 
+            download_name=f"{title}_{quality}.{ext}",
+            mimetype=f'{mode}/{ext}'
+        )
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
