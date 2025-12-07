@@ -1,54 +1,65 @@
-# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
-CORS(app)  # এটি অন্য ডোমেইন (আপনার HTML) থেকে রিকোয়েস্ট অ্যালাউ করবে
+CORS(app)
 
 def get_download_info(url):
-    # yt-dlp অপশন: আমরা সেরা ফরম্যাট এবং সরাসরি লিংক চাই
+    # আমরা এখানে কন্ডিশন দিচ্ছি: 
+    # ১. protocol^=http: লিংকটি অবশ্যই http/https হতে হবে (m3u8 না)
+    # ২. ext=mp4: ফরম্যাট অবশ্যই mp4 হতে হবে
+    # ৩. acodec!='none': অডিও থাকতে হবে
+    
     ydl_opts = {
-        'format': 'best',  # সেরা কোয়ালিটি
+        'format': 'best[protocol^=http][ext=mp4]/best[protocol^=http]',
         'quiet': True,
         'no_warnings': True,
         'geo_bypass': True,
+        'noplaylist': True,
+        # কুকেজ সমস্যা এড়ানোর জন্য ইউজার এজেন্ট ব্যবহার করা
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # ভিডিওর তথ্য বের করা
             info = ydl.extract_info(url, download=False)
             
-            # ভিডিওর টাইটেল এবং থাম্বনেইল
-            title = info.get('title', 'Unknown File')
-            thumbnail = info.get('thumbnail', '')
-            
-            # ডাউনলোড লিংক বের করা
+            # সেফটি চেক: যদি কোনো কারণে এরপরও m3u8 চলে আসে
             download_url = info.get('url')
             
-            # ফরম্যাট চেক (ভিডিও না অডিও)
-            ext = info.get('ext', 'mp4')
-
+            if 'm3u8' in str(download_url):
+                # যদি মেইন লিংক m3u8 হয়, আমরা ফরম্যাট লিস্ট ঘেঁটে mp4 খুঁজব
+                formats = info.get('formats', [])
+                for f in reversed(formats): # উল্টো দিক থেকে লুপ চালাবো (ভালো কোয়ালিটি সাধারণত শেষে থাকে)
+                    f_url = f.get('url', '')
+                    f_ext = f.get('ext', '')
+                    f_proto = f.get('protocol', '')
+                    
+                    # শর্ত: mp4 হতে হবে এবং m3u8 হওয়া যাবে না
+                    if f_ext == 'mp4' and 'm3u8' not in f_url and 'http' in f_proto:
+                        download_url = f_url
+                        break
+            
             return {
                 "status": "success",
-                "title": title,
-                "thumbnail": thumbnail,
+                "title": info.get('title', 'Video'),
+                "thumbnail": info.get('thumbnail', ''),
                 "download_url": download_url,
-                "ext": ext
+                "ext": "mp4" # আমরা জোর করে mp4 বলছি কারণ আমরা ফিল্টার করেছি
             }
+            
     except Exception as e:
-        # যদি yt-dlp ব্যর্থ হয়, আমরা ধরে নেব এটি একটি সাধারণ ফাইল (PDF/JPG)
-        # সাধারণ ফাইলের ক্ষেত্রে ইনপুট লিংকটিই ডাউনলোড লিংক
+        print(f"Error: {e}")
         return {
-            "status": "direct_link",
-            "download_url": url,
-            "title": "Direct File (PDF/Image/Zip)",
-            "thumbnail": "https://cdn-icons-png.flaticon.com/512/4208/4208397.png"
+            "status": "error", 
+            "message": "Direct MP4 link not found. Try a different video."
         }
 
 @app.route('/')
 def home():
-    return "Server is Running! 🚀"
+    return "Server is Running (Strict MP4 Mode) 🚀"
 
 @app.route('/analyze', methods=['POST'])
 def analyze_link():
